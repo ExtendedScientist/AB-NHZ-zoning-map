@@ -1,0 +1,90 @@
+name: Deploy audited map release
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - PUBLIC_RELEASE.json
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Check out hosting repository
+        uses: actions/checkout@v6
+
+      - name: Read release manifest
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          payload = json.loads(Path("PUBLIC_RELEASE.json").read_text(encoding="utf-8"))
+          required = ["artifact_url", "inner_zip", "sha256"]
+          if any(not payload.get(key) for key in required):
+              raise SystemExit("Release manifest is incomplete")
+          with Path("release.env").open("w", encoding="utf-8") as handle:
+              handle.write(f"ARTIFACT_URL={payload['artifact_url']}\n")
+              handle.write(f"INNER_ZIP={payload['inner_zip']}\n")
+              handle.write(f"EXPECTED_SHA256={payload['sha256']}\n")
+          PY
+          cat release.env >> "$GITHUB_ENV"
+
+      - name: Download audited release handoff
+        shell: bash
+        run: |
+          curl --fail --location --proto '=https' --tlsv1.2 "$ARTIFACT_URL" -o handoff.zip
+          rm -rf handoff site
+          mkdir handoff site
+          unzip -q handoff.zip -d handoff
+          test -f "handoff/$INNER_ZIP"
+
+      - name: Verify release integrity
+        shell: bash
+        run: |
+          python - <<'PY'
+          import hashlib, os
+          from pathlib import Path
+          path = Path("handoff") / os.environ["INNER_ZIP"]
+          actual = hashlib.sha256(path.read_bytes()).hexdigest()
+          expected = os.environ["EXPECTED_SHA256"].casefold()
+          if actual.casefold() != expected:
+              raise SystemExit("Release SHA-256 mismatch")
+          PY
+
+      - name: Extract and privacy-check public site
+        shell: bash
+        run: |
+          unzip -q "handoff/$INNER_ZIP" -d site
+          python privacy_verify.py site
+          test -f site/index.html
+          test -f site/app.js
+          test -f site/data/parcels_public.geojson
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+        with:
+          enablement: true
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
